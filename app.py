@@ -472,22 +472,37 @@ def ai_decide_mailroom(dossier):
 
 @app.route("/mailroom/actions", methods=["POST"])
 def mailroom_actions():
-    data = request.get_json(force=True)
+    try:
+        data = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "malformed json"}), 400
+
     op = data.get("operation")
+    if op not in ("propose", "commit"):
+        return jsonify({"error": "invalid operation"}), 400
 
     if op == "propose":
-        evaluation_id = data["evaluationId"]
-        dossiers = data["dossiers"]
+        evaluation_id = data.get("evaluationId")
+        dossiers = data.get("dossiers")
+        if not evaluation_id or not isinstance(dossiers, list):
+            return jsonify({"error": "malformed propose request"}), 400
+
+        seen_ids = set()
         proposals = []
         for d in dossiers:
             dossier_id = d.get("id") or d.get("dossierId")
+            if not dossier_id or dossier_id in seen_ids:
+                return jsonify({"error": "duplicate or missing dossier id"}), 400
+            seen_ids.add(dossier_id)
+
             fp = content_hash(d)
             cache_key = f"mailroom:decision:{fp}"
             decision = kv_get(cache_key)
             if decision is None:
                 decision = ai_decide_mailroom(d)
                 kv_set(cache_key, decision)
-            call_id = str(uuid.uuid5(uuid.NAMESPACE_URL, fp))
+
+            call_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"mailroom:{fp}"))
             proposal = {
                 "dossierId": dossier_id,
                 "callId": call_id,
@@ -496,24 +511,258 @@ def mailroom_actions():
                 "rationale": decision.get("rationale", ""),
             }
             proposals.append(proposal)
-            kv_set(f"mailroom:proposal:{evaluation_id}:{dossier_id}", proposal)
-        kv_set(f"mailroom:eval:{evaluation_id}", {"proposals": proposals})
-        return jsonify({"status": "awaiting_receipts", "proposals": proposals})
+            kv_set(f"mailroom:proposal:{call_id}", proposal)
 
-    if op == "commit":
-        receipts = data["receipts"]
-        outcomes = []
-        for r in receipts:
-            stored = kv_get(f"mailroom:receipt:{r.get('callId')}")
-            if stored and stored == r:
-                outcomes.append({"callId": r["callId"], "status": "completed"})
-                continue
-            kv_set(f"mailroom:receipt:{r.get('callId')}", r)
-            outcomes.append({"callId": r.get("callId"), "status": "completed"})
-        return jsonify({"status": "completed", "outcomes": outcomes})
+        kv_set(f"mailroom:eval:{evaluation_id}", {"proposals": proposals, "dossierFingerprint": content_hash(dossiers)})
+        resp = jsonify({"status": "awaiting_receipts", "proposals": proposals})
+        resp.headers["Content-Type"] = "application/json"
+        return resp, 200
 
-    return jsonify({"error": "invalid operation"}), 400
+    # commit
+    receipts = data.get("receipts")
+    if not isinstance(receipts, list):
+        return jsonify({"error": "malformed commit request"}), 400
 
+    outcomes = []
+    for r in receipts:
+        call_id = r.get("callId")
+        proposal = kv_get(f"mailroom:proposal:{call_id}")
+        if not proposal:
+            return jsonify({"error": f"unknown callId {call_id}"}), 409
+
+        prior_receipt = kv_get(f"mailroom:receipt:{call_id}")
+        if prior_receipt is not None:
+            if prior_receipt != r:
+                return jsonify({"error": "receipt conflict"}), 409
+            outcomes.append({"callId": call_id, "status": "completed", "action": proposal["action"]})
+            continue
+
+        kv_set(f"mailroom:receipt:{call_id}", r)
+        outcomes.append({"callId": call_id, "status": "completed", "action": proposal["action"]})
+
+    resp = jsonify({"status": "completed", "outcomes": outcomes})
+    resp.headers["Content-Type"] = "application/json"
+    return resp, 200
+
+#Q!0
+A2A_BEARER_TOKEN = os.environ.get("A2A_BEARER_TOKEN", "change-me-token")
+A2A_BASE_URL = os.environ.get("A2A_BASE_URL", "https://your-app.onrender.com/a2a")
+
+def require_a2a_auth():
+    auth = request.headers.get("Authorization", "")
+    if auth != f"Bearer {A2A_BEARER_TOKEN}":
+        return False
+    if request.headers.get("A2A-Version") != "1.0":
+        return None  # signals wrong-version case
+    return True
+
+
+@app.route("/.well-known/agent-card.json", methods=["GET"])
+def agent_card():
+    card = {
+        "name": "Invoice Action Agent",
+        "description": "Reconciles invoice batches and proposes one action per invoice package.",
+        "version": "1.0.0",
+        "capabilities": {},
+        "skills": [{
+            "name": "invoice_action_agent",
+            "description": "Chooses settle/approve/hold/reject/exception actions for invoice packages.",
+            "tags": ["invoice", "reconciliation", "finance"],
+        }],
+        "supportedInterfaces": [{
+            "url": A2A_BASE_URL,
+            "protocolBinding": "HTTP+JSON",
+            "protocolVersion": "1.0",
+        }],
+        "defaultInputModes": ["application/vnd.ga5.invoice-claim-batch+json"],
+        "defaultOutputModes": [
+            "application/vnd.ga5.invoice-action-proposals+json",
+            "application/vnd.ga5.invoice-action-receipts+json",
+        ],
+    }
+    resp = jsonify(card)
+    resp.headers["Content-Type"] = "application/a2a+json"
+    return resp, 200
+
+
+def a2a_task_key(task_id):
+    return f"a2a:task:{task_id}"
+
+
+def a2a_msgid_key(principal, message_id):
+    return f"a2a:msgid:{principal}:{message_id}"
+
+
+ACTIONS = {"settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"}
+
+
+def ai_decide_invoice(pkg):
+    if not groq_client:
+        return {"action": "open_exception", "evidenceRefs": [], "rationale": "no model configured"}
+    resp = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": (
+                "Classify one invoice package into exactly one action: settle_invoice, "
+                "request_approval, hold_invoice, reject_duplicate, open_exception. "
+                "Cite the decisive bracketed evidence references, e.g. [ev_3]. "
+                "Return strict JSON: {\"action\":\"...\", \"vendorName\":\"...\", "
+                "\"invoiceNumber\":\"...\", \"amountMinor\":0, \"currency\":\"...\", "
+                "\"evidenceRefs\":[\"...\"], \"rationale\":\"...\"}"
+            )},
+            {"role": "user", "content": json.dumps(pkg)[:6000]},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
+    )
+    return json.loads(resp.choices[0].message.content)
+
+
+@app.route("/a2a/message:send", methods=["POST"])
+def a2a_message_send():
+    auth = require_a2a_auth()
+    if auth is None:
+        return jsonify({"error": "unsupported A2A version"}), 400
+    if not auth:
+        return jsonify({"error": "unauthorized"}), 401
+
+    principal = request.headers.get("Authorization")
+    body = request.get_json(force=True)
+    message = body.get("message", {})
+    message_id = message.get("messageId")
+    task_id_in = message.get("taskId")
+
+    if not message_id:
+        return jsonify({"error": "missing messageId"}), 400
+
+    msg_hash = content_hash(message)
+    dedup_key = a2a_msgid_key(principal, message_id)
+    existing = kv_get(dedup_key)
+    if existing:
+        if existing["hash"] != msg_hash:
+            return jsonify({"error": "IDEMPOTENCY_CONFLICT"}), 409
+        return jsonify({"task": kv_get(a2a_task_key(existing["taskId"]))}), 200
+
+    part = message["parts"][0]
+    media_type = part.get("mediaType")
+
+    if media_type == "application/vnd.ga5.invoice-action-results+json":
+        # continuation with grader results
+        data = part["data"]
+        task = kv_get(a2a_task_key(task_id_in))
+        if not task or task.get("contextId") != message.get("contextId") or task.get("owner") != principal:
+            return jsonify({"error": "task not found"}), 404
+        if task["state"] == "TASK_STATE_COMPLETED":
+            kv_set(dedup_key, {"hash": msg_hash, "taskId": task["id"]})
+            return jsonify({"task": task}), 200
+
+        executions = []
+        for r in data.get("results", []):
+            if r.get("outcome") == "ACCEPTED":
+                prop = next((p for p in task["proposals"] if p["packageId"] == r["packageId"]), None)
+                if prop and prop["actionId"] == r["actionId"] and prop["action"] == r["action"]:
+                    executions.append({
+                        "packageId": prop["packageId"], "actionId": prop["actionId"],
+                        "action": prop["action"], "receiptNonce": r["receiptNonce"],
+                        "facts": prop["facts"], "evidenceRefs": prop["evidenceRefs"],
+                    })
+        task["state"] = "TASK_STATE_COMPLETED"
+        task["receiptsArtifact"] = {"batchId": data.get("batchId"), "executions": executions}
+        task["history"].append(message)
+        kv_set(a2a_task_key(task["id"]), task)
+        kv_set(dedup_key, {"hash": msg_hash, "taskId": task["id"]})
+        return jsonify({"task": task}), 200
+
+    # initial batch submission
+    data = part["data"]
+    batch_id = data.get("batchId")
+    packages = data.get("packages", [])
+    task_id = str(uuid.uuid4())
+    context_id = str(uuid.uuid4())
+
+    proposals = []
+    seen = set()
+    for pkg in packages:
+        pkg_id = pkg.get("packageId") or pkg.get("id")
+        if pkg_id in seen:
+            continue
+        seen.add(pkg_id)
+        fp = content_hash(pkg)
+        decision = kv_get(f"a2a:decision:{fp}")
+        if decision is None:
+            decision = ai_decide_invoice(pkg)
+            kv_set(f"a2a:decision:{fp}", decision)
+        action_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"a2a:{fp}"))
+        proposals.append({
+            "packageId": pkg_id,
+            "actionId": action_id,
+            "action": decision.get("action") if decision.get("action") in ACTIONS else "open_exception",
+            "facts": {
+                "vendorName": decision.get("vendorName", ""),
+                "invoiceNumber": decision.get("invoiceNumber", ""),
+                "amountMinor": decision.get("amountMinor", 0),
+                "currency": decision.get("currency", "INR"),
+            },
+            "evidenceRefs": decision.get("evidenceRefs", [])[:3],
+            "rationale": decision.get("rationale", "")[:1500],
+        })
+
+    task = {
+        "id": task_id,
+        "contextId": context_id,
+        "owner": principal,
+        "state": "TASK_STATE_INPUT_REQUIRED",
+        "history": [message],
+        "proposals": proposals,
+        "batchId": batch_id,
+    }
+    kv_set(a2a_task_key(task_id), task)
+    kv_set(dedup_key, {"hash": msg_hash, "taskId": task_id})
+
+    resp_task = dict(task)
+    resp_task["artifact"] = {
+        "mediaType": "application/vnd.ga5.invoice-action-proposals+json",
+        "data": {"batchId": batch_id, "proposals": proposals},
+    }
+    return jsonify({"task": resp_task}), 200
+
+
+@app.route("/a2a/tasks/<task_id>", methods=["GET"])
+def a2a_get_task(task_id):
+    if not require_a2a_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    principal = request.headers.get("Authorization")
+    task = kv_get(a2a_task_key(task_id))
+    if not task or task.get("owner") != principal:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(task), 200
+
+
+@app.route("/a2a/tasks", methods=["GET"])
+def a2a_list_tasks():
+    if not require_a2a_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    principal = request.headers.get("Authorization")
+    conn = db()
+    rows = conn.execute("SELECT v FROM kv WHERE k LIKE 'a2a:task:%'").fetchall()
+    conn.close()
+    tasks = [json.loads(r[0]) for r in rows if json.loads(r[0]).get("owner") == principal]
+    return jsonify({"tasks": tasks}), 200
+
+
+@app.route("/a2a/tasks/<task_id>:cancel", methods=["POST"])
+def a2a_cancel_task(task_id):
+    if not require_a2a_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    principal = request.headers.get("Authorization")
+    task = kv_get(a2a_task_key(task_id))
+    if not task or task.get("owner") != principal:
+        return jsonify({"error": "not found"}), 404
+    if task["state"] in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"):
+        return jsonify({"error": "already terminal"}), 409
+    task["state"] = "TASK_STATE_CANCELED"
+    kv_set(a2a_task_key(task_id), task)
+    return jsonify(task), 200
 
 # =========================================================================
 # Q10 & Q11 — A2A invoice agent / Observable incident agent
